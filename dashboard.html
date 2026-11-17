@@ -2,6 +2,8 @@
 <meta name="claude:viewport-fit-sides" content="cover">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.3/sql-wasm.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.2/jspdf.plugin.autotable.min.js"></script>
 <style>
 :root {
   --bg: #f8f9fb; --bg-card: #ffffff; --bg-input: #f0f2f5;
@@ -193,6 +195,7 @@ footer { text-align: center; padding: 20px 0; color: var(--fg-dim); font-size: 1
 <div class="header">
   <h1>Network Monitor</h1>
   <div class="header-actions">
+    <button class="export-btn" id="btnExportPdf" onclick="exportPdf()" disabled>PDF-Report</button>
     <button class="export-btn" id="btnExportPing" onclick="exportCsv('ping')" disabled>Ping-CSV</button>
     <button class="export-btn" id="btnExportIperf" onclick="exportCsv('iperf')" disabled>iperf-CSV</button>
     <button class="primary" onclick="document.getElementById('fileDb').click()">SQLite-Datenbank laden</button>
@@ -241,7 +244,7 @@ footer { text-align: center; padding: 20px 0; color: var(--fg-dim); font-size: 1
     <input type="number" id="pingFilterLatency" placeholder="ms" style="width:60px" oninput="renderPingTab()">
     <label>iperf:</label>
     <select id="pingFilterIperf" onchange="renderPingTab()">
-      <option value="all">Alle</option><option value="0" selected>Ohne iperf</option><option value="1">Waehrend iperf</option>
+      <option value="all" selected>Alle</option><option value="0">Ohne iperf</option><option value="1">Waehrend iperf</option>
     </select>
     <span id="pingRowCount" class="filter-count"></span>
   </div>
@@ -355,6 +358,7 @@ async function loadDb(file) {
     locateFile: f => `https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.3/${f}`
   });
   db = new SQL.Database(new Uint8Array(buf));
+  document.getElementById('btnExportPdf').disabled = false;
   document.getElementById('btnExportPing').disabled = false;
   document.getElementById('btnExportIperf').disabled = false;
   document.getElementById('btnReload').hidden = false;
@@ -548,7 +552,10 @@ function render() {
 
 function renderStats() {
   const el = document.getElementById('statsRow');
-  const pingTotal = query(`SELECT COUNT(*) as c FROM ping WHERE 1=1${sf('ping')}`)[0]?.c || 0;
+  // Exclude ping failures that occurred during iperf (unreliable due to bandwidth saturation)
+  const noIperfFail = ' AND NOT (status=\'FAIL\' AND during_iperf=1)';
+  const pingTotal = query(`SELECT COUNT(*) as c FROM ping WHERE 1=1${sf('ping')}${noIperfFail}`)[0]?.c || 0;
+  const iperfFailCount = query(`SELECT COUNT(*) as c FROM ping WHERE status='FAIL' AND during_iperf=1${sf('ping')}`)[0]?.c || 0;
   const iperfTotal = query(`SELECT COUNT(*) as c FROM iperf WHERE 1=1${sf('iperf')}`)[0]?.c || 0;
 
   if (pingTotal === 0 && iperfTotal === 0) {
@@ -564,23 +571,26 @@ function renderStats() {
     const okCount = query(`SELECT COUNT(*) as c FROM ping WHERE status='OK'${sf('ping')}`)[0]?.c || 0;
     const failCount = pingTotal - okCount;
     const pct = ((okCount / pingTotal) * 100).toFixed(1);
-    const latencies = query(`SELECT latency_ms FROM ping WHERE status='OK'${sf('ping')} ORDER BY latency_ms`).map(r => r.latency_ms);
-    const avgLat = latencies.length ? (latencies.reduce((a,b) => a+b, 0) / latencies.length) : 0;
-    const minLat = latencies.length ? latencies[0] : 0;
-    const maxLat = latencies.length ? latencies[latencies.length - 1] : 0;
-    const p95 = percentile(latencies, 95);
-    const p99 = percentile(latencies, 99);
-    const targets = query(`SELECT DISTINCT target FROM ping WHERE 1=1${sf('ping')}`).map(r => r.target);
+    const latStats = query(`SELECT AVG(latency_ms) as avg, MIN(latency_ms) as min, MAX(latency_ms) as max FROM ping WHERE status='OK'${sf('ping')}${noIperfFail}`)[0] || {};
+    const avgLat = num(latStats.avg);
+    const minLat = num(latStats.min);
+    const maxLat = num(latStats.max);
+    const p95Row = query(`SELECT latency_ms as v FROM ping WHERE status='OK'${sf('ping')}${noIperfFail} ORDER BY latency_ms ASC LIMIT 1 OFFSET (SELECT CAST(COUNT(*)*0.95 AS INTEGER) FROM ping WHERE status='OK'${sf('ping')}${noIperfFail})`);
+    const p99Row = query(`SELECT latency_ms as v FROM ping WHERE status='OK'${sf('ping')}${noIperfFail} ORDER BY latency_ms ASC LIMIT 1 OFFSET (SELECT CAST(COUNT(*)*0.99 AS INTEGER) FROM ping WHERE status='OK'${sf('ping')}${noIperfFail})`);
+    const p95 = p95Row.length ? num(p95Row[0].v) : avgLat;
+    const p99 = p99Row.length ? num(p99Row[0].v) : avgLat;
+    const targets = query(`SELECT DISTINCT target FROM ping WHERE 1=1${sf('ping')}${noIperfFail}`).map(r => r.target);
 
-    // Per-target failures
-    const targetFails = query(`SELECT target, COUNT(*) as fails FROM ping WHERE status='FAIL'${sf('ping')} GROUP BY target ORDER BY fails DESC`);
+    // Per-target failures (excluding iperf fails)
+    const targetFails = query(`SELECT target, COUNT(*) as fails FROM ping WHERE status='FAIL'${sf('ping')}${noIperfFail} GROUP BY target ORDER BY fails DESC`);
     let worstTarget = '';
     if (targetFails.length) {
       worstTarget = targetFails.map(t => `${t.target}: ${t.fails}x`).join(', ');
     }
 
     const pctClass = pct >= 99 ? 'stat-ok' : pct >= 95 ? 'stat-warn' : 'stat-crit';
-    cards.push(statCard('Verfuegbarkeit', `${pct}%`, `${okCount}/${pingTotal} OK`, pctClass));
+    const iperfNote = iperfFailCount > 0 ? ` (${iperfFailCount} iperf-Fails ausgeblendet)` : '';
+    cards.push(statCard('Verfuegbarkeit', `${pct}%`, `${okCount}/${pingTotal} OK${iperfNote}`, pctClass));
     cards.push(statCard('Latenz Avg', `${avgLat.toFixed(1)} ms`, `Min: ${minLat.toFixed(1)} / Max: ${maxLat.toFixed(1)}`));
     cards.push(statCard('Latenz P95', `${p95.toFixed(1)} ms`, `P99: ${p99.toFixed(1)} ms`));
     cards.push(statCard('Ping-Ausfaelle', failCount, worstTarget || 'Keine Ausfaelle', failCount > 0 ? 'stat-crit' : 'stat-ok'));
@@ -910,38 +920,37 @@ function renderOverviewCharts() {
   grid.innerHTML = '';
   const c = getC();
 
-  const pingRows = query(`SELECT * FROM ping WHERE 1=1${sf('ping')} ORDER BY timestamp`);
-  const iperfRows = query(`SELECT * FROM iperf WHERE 1=1${sf('iperf')} ORDER BY timestamp`);
+  const noIperfFail = ' AND NOT (status=\'FAIL\' AND during_iperf=1)';
+  const pingCount = query(`SELECT COUNT(*) as c FROM ping WHERE 1=1${sf('ping')}${noIperfFail}`)[0]?.c || 0;
+  const iperfCount = query(`SELECT COUNT(*) as c FROM iperf WHERE 1=1${sf('iperf')}`)[0]?.c || 0;
 
-  if (!pingRows.length && !iperfRows.length) { grid.hidden = true; return; }
+  if (!pingCount && !iperfCount) { grid.hidden = true; return; }
   grid.hidden = false;
 
-  if (pingRows.length) {
-    const targets = [...new Set(pingRows.map(r => r.target))];
+  if (pingCount) {
+    const targets = query(`SELECT DISTINCT target FROM ping WHERE 1=1${sf('ping')}${noIperfFail}`).map(r => r.target);
     const colors = [c.accent, c.ok, c.warn, c.crit, '#a78bfa', '#fb923c'];
 
+    // Sample ~600 points per target via rowid modulo
+    const sampleRate = Math.max(1, Math.floor(pingCount / (600 * targets.length)));
+    const sampled = query(`SELECT timestamp, target, latency_ms FROM ping WHERE status='OK'${sf('ping')} AND rowid % ${sampleRate} = 0 ORDER BY timestamp`);
+
     svgChart(grid, 'Ping-Latenz (alle Ziele)', 'line',
-      targets.map((t, i) => {
-        const sampled = downsample(pingRows.filter(r => r.target === t && r.status === 'OK'), 600);
-        return {
-          label: t, data: sampled.map(r => ({ x: ts(r.timestamp), y: num(r.latency_ms) })).filter(d => !isNaN(d.x)),
-          borderColor: colors[i % colors.length], pointRadius: 0, borderWidth: 1.5
-        };
-      })
+      targets.map((t, i) => ({
+        label: t, data: sampled.filter(r => r.target === t).map(r => ({ x: ts(r.timestamp), y: num(r.latency_ms) })).filter(d => !isNaN(d.x)),
+        borderColor: colors[i % colors.length], pointRadius: 0, borderWidth: 1.5
+      }))
     );
 
-    const buckets = {};
-    pingRows.forEach(r => {
-      const d = ts(r.timestamp);
-      if (isNaN(d)) return;
-      const key = Math.floor(d / 300000) * 300000;
-      if (!buckets[key]) buckets[key] = { total: 0, ok: 0 };
-      buckets[key].total++;
-      if (r.status === 'OK') buckets[key].ok++;
-    });
-    const bucketData = Object.entries(buckets)
-      .map(([k, v]) => ({ x: Number(k), y: parseFloat((v.ok / v.total * 100).toFixed(1)) }))
-      .sort((a, b) => a.x - b.x);
+    // Availability in 5-min windows via SQL aggregation (excluding iperf fails)
+    const bucketData = query(`SELECT
+      CAST(strftime('%s', REPLACE(timestamp, ' ', 'T')) AS INTEGER) / 300 * 300 as bucket,
+      COUNT(*) as total,
+      SUM(CASE WHEN status='OK' THEN 1 ELSE 0 END) as ok
+      FROM ping WHERE 1=1${sf('ping')}${noIperfFail} GROUP BY bucket ORDER BY bucket`).map(r => ({
+        x: r.bucket * 1000,
+        y: parseFloat((r.ok / r.total * 100).toFixed(1))
+      })).filter(d => !isNaN(d.x));
 
     if (bucketData.length) {
       svgChart(grid, 'Verfuegbarkeit (5-Min-Fenster)', 'line',
@@ -951,7 +960,8 @@ function renderOverviewCharts() {
     }
   }
 
-  if (iperfRows.length) {
+  if (iperfCount) {
+    const iperfRows = query(`SELECT timestamp, protocol, direction, bandwidth_mbps, jitter_ms, packet_loss_pct, retransmits FROM iperf WHERE 1=1${sf('iperf')} ORDER BY timestamp`);
     const tcpUp = iperfRows.filter(r => r.protocol === 'TCP' && (r.direction || 'Upload') === 'Upload');
     const tcpDn = iperfRows.filter(r => r.protocol === 'TCP' && (r.direction || 'Upload') === 'Download');
     const udpUp = iperfRows.filter(r => r.protocol === 'UDP' && (r.direction || 'Upload') === 'Upload');
@@ -982,67 +992,76 @@ function renderOverviewCharts() {
 
 function renderPingTab() {
   const tbody = document.querySelector('#pingTable tbody');
-  let rows = query(`SELECT * FROM ping WHERE 1=1${sf('ping')} ORDER BY timestamp DESC LIMIT 5000`);
 
-  // Populate target filter
+  // Populate target filter from lightweight query
   const targetSel = document.getElementById('pingFilterTarget');
-  const curTarget = targetSel.value;
-  const targets = [...new Set(rows.map(r => r.target))];
   if (targetSel.options.length <= 1) {
-    targets.forEach(t => { const o = document.createElement('option'); o.value = t; o.textContent = t; targetSel.appendChild(o); });
+    const curTarget = targetSel.value;
+    const targets = query(`SELECT DISTINCT target FROM ping WHERE 1=1${sf('ping')}`);
+    targets.forEach(r => { const o = document.createElement('option'); o.value = r.target; o.textContent = r.target; targetSel.appendChild(o); });
     targetSel.value = curTarget;
   }
 
-  // Apply filters
+  // Build SQL WHERE from filters
   const filterTarget = document.getElementById('pingFilterTarget').value;
   const filterStatus = document.getElementById('pingFilterStatus').value;
   const filterLatency = parseFloat(document.getElementById('pingFilterLatency').value);
   const filterIperf = document.getElementById('pingFilterIperf').value;
 
-  if (filterTarget !== 'all') rows = rows.filter(r => r.target === filterTarget);
-  if (filterStatus !== 'all') rows = rows.filter(r => r.status === filterStatus);
-  if (!isNaN(filterLatency)) rows = rows.filter(r => r.status === 'OK' && num(r.latency_ms) > filterLatency);
-  if (filterIperf !== 'all') rows = rows.filter(r => String(r.during_iperf || 0) === filterIperf);
+  let where = `WHERE 1=1${sf('ping')}`;
+  if (filterTarget !== 'all') where += ` AND target = '${filterTarget.replace(/'/g, "''")}'`;
+  if (filterStatus !== 'all') where += ` AND status = '${filterStatus}'`;
+  if (!isNaN(filterLatency)) where += ` AND status = 'OK' AND latency_ms > ${filterLatency}`;
+  if (filterIperf !== 'all') where += ` AND during_iperf = ${filterIperf === '1' ? 1 : 0}`;
 
-  const shown = rows.slice(0, 1000);
-  document.getElementById('pingRowCount').textContent = `${shown.length}/${rows.length} Zeilen`;
+  const totalCount = query(`SELECT COUNT(*) as c FROM ping ${where}`)[0]?.c || 0;
+  const rows = query(`SELECT timestamp, target, status, latency_ms, ttl, during_iperf FROM ping ${where} ORDER BY timestamp DESC LIMIT 1000`);
 
-  if (!shown.length) {
+  document.getElementById('pingRowCount').textContent = `${rows.length}/${totalCount} Zeilen`;
+
+  if (!rows.length) {
     tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:var(--fg-muted);padding:30px">Keine Ping-Daten</td></tr>';
-    return;
+  } else {
+    try {
+      tbody.innerHTML = rows.map(r => {
+        const pill = r.status === 'OK' ? '<span class="pill pill-ok">OK</span>' : '<span class="pill pill-fail">FAIL</span>';
+        const lat = r.status === 'OK' ? fmt(r.latency_ms) + ' ms' : '-';
+        const ttl = r.status === 'OK' ? r.ttl : '-';
+        const iperfBadge = (r.during_iperf == 1) ? '<span style="color:var(--warn);font-weight:600">Ja</span>' : '<span style="color:var(--fg-dim)">-</span>';
+        return `<tr><td>${r.timestamp||''}</td><td>${r.target||''}</td><td>${pill}</td><td>${lat}</td><td>${ttl}</td><td>${iperfBadge}</td></tr>`;
+      }).join('');
+    } catch(e) { console.error('Ping table render error:', e); }
   }
 
-  try {
-    tbody.innerHTML = shown.map(r => {
-      const pill = r.status === 'OK' ? '<span class="pill pill-ok">OK</span>' : '<span class="pill pill-fail">FAIL</span>';
-      const lat = r.status === 'OK' ? fmt(r.latency_ms) + ' ms' : '-';
-      const ttl = r.status === 'OK' ? r.ttl : '-';
-      const iperfBadge = (r.during_iperf == 1) ? '<span style="color:var(--warn);font-weight:600">Ja</span>' : '<span style="color:var(--fg-dim)">-</span>';
-      return `<tr><td>${r.timestamp||''}</td><td>${r.target||''}</td><td>${pill}</td><td>${lat}</td><td>${ttl}</td><td>${iperfBadge}</td></tr>`;
-    }).join('');
-  } catch(e) { console.error('Ping table render error:', e); }
-
+  // Charts: use sampled data via SQL to avoid pulling all rows
   const chartsEl = document.getElementById('pingCharts');
   chartsEl.innerHTML = '';
   const c = getC();
-  const allPing = query(`SELECT * FROM ping WHERE status='OK'${sf('ping')} ORDER BY timestamp`);
-  const chartTargets = [...new Set(allPing.map(r => r.target))];
+  const chartTargets = query(`SELECT DISTINCT target FROM ping WHERE status='OK'${sf('ping')}`).map(r => r.target);
   const colors = [c.accent, c.ok, c.warn, c.crit, '#a78bfa', '#fb923c'];
 
-  if (chartTargets.length && allPing.length > 10) {
-    const sampled = downsample(allPing, 2000);
-    svgChart(chartsEl, 'Latenz-Verlauf (alle Ziele)', 'line',
-      chartTargets.map((t, i) => ({
-        label: t, data: sampled.filter(r => r.target === t).map(r => ({ x: ts(r.timestamp), y: num(r.latency_ms) })).filter(d => !isNaN(d.x)),
-        borderColor: colors[i % colors.length], pointRadius: 0, borderWidth: 1.5, fill: false
-      }))
-    );
+  if (chartTargets.length) {
+    const totalOk = query(`SELECT COUNT(*) as c FROM ping WHERE status='OK'${sf('ping')}`)[0]?.c || 0;
+    if (totalOk > 10) {
+      // Sample ~600 points per target using NTILE or modulo
+      const sampleRate = Math.max(1, Math.floor(totalOk / (600 * chartTargets.length)));
+      const sampled = query(`SELECT timestamp, target, latency_ms FROM ping WHERE status='OK'${sf('ping')} AND rowid % ${sampleRate} = 0 ORDER BY timestamp`);
 
-    const perTargetAvail = chartTargets.map(t => {
-      const total = query(`SELECT COUNT(*) as c FROM ping WHERE target='${t}'${sf('ping')}`)[0]?.c || 0;
-      const ok = query(`SELECT COUNT(*) as c FROM ping WHERE target='${t}' AND status='OK'${sf('ping')}`)[0]?.c || 0;
-      return { target: t, total, ok, fail: total - ok, pct: total > 0 ? (ok / total * 100) : 0 };
-    });
+      svgChart(chartsEl, 'Latenz-Verlauf (alle Ziele)', 'line',
+        chartTargets.map((t, i) => ({
+          label: t, data: sampled.filter(r => r.target === t).map(r => ({ x: ts(r.timestamp), y: num(r.latency_ms) })).filter(d => !isNaN(d.x)),
+          borderColor: colors[i % colors.length], pointRadius: 0, borderWidth: 1.5, fill: false
+        }))
+      );
+    }
+
+    const perTargetAvail = query(`SELECT target, COUNT(*) as total,
+      SUM(CASE WHEN status='OK' THEN 1 ELSE 0 END) as ok
+      FROM ping WHERE 1=1${sf('ping')} GROUP BY target`).map(r => ({
+        target: r.target, total: r.total, ok: r.ok, fail: r.total - r.ok,
+        pct: r.total > 0 ? (r.ok / r.total * 100) : 0
+      }));
+
     const availCard = document.createElement('div');
     availCard.className = 'chart-card';
     availCard.innerHTML = '<h2>VERFUEGBARKEIT PRO ZIEL</h2>';
@@ -1076,20 +1095,22 @@ function renderPingTab() {
 
 function renderIperfTab() {
   const tbody = document.querySelector('#iperfTable tbody');
-  let rows = query(`SELECT * FROM iperf WHERE 1=1${sf('iperf')} ORDER BY timestamp DESC`);
 
-  // Apply filters
   const filterProto = document.getElementById('iperfFilterProto').value;
   const filterDir = document.getElementById('iperfFilterDir').value;
   const filterBw = parseFloat(document.getElementById('iperfFilterBw').value);
   const filterJitter = parseFloat(document.getElementById('iperfFilterJitter').value);
 
-  if (filterProto !== 'all') rows = rows.filter(r => r.protocol === filterProto);
-  if (filterDir !== 'all') rows = rows.filter(r => (r.direction || 'Upload') === filterDir);
-  if (!isNaN(filterBw)) rows = rows.filter(r => num(r.bandwidth_mbps) < filterBw);
-  if (!isNaN(filterJitter)) rows = rows.filter(r => r.protocol === 'UDP' && num(r.jitter_ms) > filterJitter);
+  let where = `WHERE 1=1${sf('iperf')}`;
+  if (filterProto !== 'all') where += ` AND protocol = '${filterProto}'`;
+  if (filterDir !== 'all') where += ` AND direction = '${filterDir}'`;
+  if (!isNaN(filterBw)) where += ` AND bandwidth_mbps < ${filterBw}`;
+  if (!isNaN(filterJitter)) where += ` AND protocol = 'UDP' AND jitter_ms > ${filterJitter}`;
 
-  document.getElementById('iperfRowCount').textContent = `${rows.length} Zeilen`;
+  const rows = query(`SELECT timestamp, target, protocol, direction, bandwidth_mbps, jitter_ms, packet_loss_pct, retransmits FROM iperf ${where} ORDER BY timestamp DESC LIMIT 1000`);
+  const totalCount = query(`SELECT COUNT(*) as c FROM iperf ${where}`)[0]?.c || 0;
+
+  document.getElementById('iperfRowCount').textContent = `${rows.length}/${totalCount} Zeilen`;
 
   if (!rows.length) {
     tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--fg-muted);padding:30px">Keine iperf-Daten</td></tr>';
@@ -1110,10 +1131,10 @@ function renderIperfTab() {
   chartsEl.innerHTML = '';
   const c = getC();
 
-  const tcpUp = query(`SELECT * FROM iperf WHERE protocol='TCP' AND (direction='Upload' OR direction IS NULL)${sf('iperf')} ORDER BY timestamp`);
-  const tcpDn = query(`SELECT * FROM iperf WHERE protocol='TCP' AND direction='Download'${sf('iperf')} ORDER BY timestamp`);
-  const udpUp = query(`SELECT * FROM iperf WHERE protocol='UDP' AND (direction='Upload' OR direction IS NULL)${sf('iperf')} ORDER BY timestamp`);
-  const udpDn = query(`SELECT * FROM iperf WHERE protocol='UDP' AND direction='Download'${sf('iperf')} ORDER BY timestamp`);
+  const tcpUp = query(`SELECT timestamp, bandwidth_mbps, retransmits FROM iperf WHERE protocol='TCP' AND (direction='Upload' OR direction IS NULL)${sf('iperf')} ORDER BY timestamp`);
+  const tcpDn = query(`SELECT timestamp, bandwidth_mbps, retransmits FROM iperf WHERE protocol='TCP' AND direction='Download'${sf('iperf')} ORDER BY timestamp`);
+  const udpUp = query(`SELECT timestamp, bandwidth_mbps, jitter_ms, packet_loss_pct FROM iperf WHERE protocol='UDP' AND (direction='Upload' OR direction IS NULL)${sf('iperf')} ORDER BY timestamp`);
+  const udpDn = query(`SELECT timestamp, bandwidth_mbps, jitter_ms, packet_loss_pct FROM iperf WHERE protocol='UDP' AND direction='Download'${sf('iperf')} ORDER BY timestamp`);
 
   if (tcpUp.length || tcpDn.length) {
     const tcpBwDs = [];
@@ -1136,6 +1157,402 @@ function renderIperfTab() {
       [{ label: 'Jitter (ms)', data: allUdp.map(r => ({ x: ts(r.timestamp), y: num(r.jitter_ms) })).filter(d => !isNaN(d.x)), borderColor: c.warn, borderWidth: 2 }]
     );
   }
+}
+
+// PDF Export
+function exportPdf() {
+  if (!db) return;
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
+  const pw = doc.internal.pageSize.getWidth();
+  const ph = doc.internal.pageSize.getHeight();
+  const margin = 16;
+  const contentW = pw - margin * 2;
+  let y = 0;
+  const noIperfFail = ' AND NOT (status=\'FAIL\' AND during_iperf=1)';
+  const accentRgb = [59, 130, 246];
+  const okRgb = [16, 185, 129];
+  const warnRgb = [245, 158, 11];
+  const critRgb = [239, 68, 68];
+  const darkGray = [51, 65, 85];
+  const midGray = [100, 116, 139];
+  const lightBg = [248, 250, 252];
+  const genDate = new Date().toLocaleString('de-DE');
+
+  function addPage() { doc.addPage(); y = 20; }
+  function checkPage(needed) { if (y + needed > ph - 20) addPage(); }
+
+  function addFooters() {
+    const pages = doc.internal.getNumberOfPages();
+    for (let i = 1; i <= pages; i++) {
+      doc.setPage(i);
+      doc.setFontSize(7);
+      doc.setFont('helvetica', 'normal');
+      doc.setTextColor(160);
+      doc.text('Network Performance Monitor', margin, ph - 8);
+      doc.text(`Erstellt: ${genDate}`, pw / 2, ph - 8, { align: 'center' });
+      doc.text(`Seite ${i} / ${pages}`, pw - margin, ph - 8, { align: 'right' });
+      doc.setDrawColor(220);
+      doc.line(margin, ph - 12, pw - margin, ph - 12);
+    }
+  }
+
+  function sectionHeader(title) {
+    checkPage(14);
+    doc.setFillColor(...accentRgb);
+    doc.rect(margin, y, 3, 7, 'F');
+    doc.setFontSize(11);
+    doc.setFont('helvetica', 'bold');
+    doc.setTextColor(...darkGray);
+    doc.text(title, margin + 7, y + 5.5);
+    y += 12;
+  }
+
+  // ── Cover header ──
+  doc.setFillColor(...accentRgb);
+  doc.rect(0, 0, pw, 42, 'F');
+  doc.setFontSize(22);
+  doc.setFont('helvetica', 'bold');
+  doc.setTextColor(255);
+  doc.text('Network Performance Report', margin, 18);
+  doc.setFontSize(10);
+  doc.setFont('helvetica', 'normal');
+  doc.setTextColor(200, 220, 255);
+  const sessionLabel = currentSession === 'all' ? 'Alle Sessions' :
+    (document.getElementById('sessionSelect').selectedOptions[0]?.textContent || currentSession);
+  doc.text(sessionLabel, margin, 28);
+
+  // Time range
+  const firstPing = query(`SELECT MIN(timestamp) as t FROM ping WHERE 1=1${sf('ping')}`)[0]?.t || '';
+  const lastPing = query(`SELECT MAX(timestamp) as t FROM ping WHERE 1=1${sf('ping')}`)[0]?.t || '';
+  if (firstPing) {
+    doc.text(`Zeitraum: ${firstPing}  -  ${lastPing}`, margin, 36);
+  }
+  doc.text(genDate, pw - margin, 36, { align: 'right' });
+
+  y = 52;
+  doc.setTextColor(0);
+
+  // ── Data collection ──
+  const pingTotal = query(`SELECT COUNT(*) as c FROM ping WHERE 1=1${sf('ping')}${noIperfFail}`)[0]?.c || 0;
+  const iperfFailExcluded = query(`SELECT COUNT(*) as c FROM ping WHERE status='FAIL' AND during_iperf=1${sf('ping')}`)[0]?.c || 0;
+  const iperfTotal = query(`SELECT COUNT(*) as c FROM iperf WHERE 1=1${sf('iperf')}`)[0]?.c || 0;
+
+  if (pingTotal === 0 && iperfTotal === 0) {
+    doc.setFontSize(12);
+    doc.text('Keine Daten in dieser Session.', margin, y);
+    addFooters();
+    doc.save('network-report.pdf');
+    showToast('PDF gespeichert');
+    return;
+  }
+
+  let healthScore = 100;
+  let healthParts = [];
+  let findings = [];
+  let statsRows = [];
+  let pct = 0, avgLat = 0, p95 = 0, p99 = 0;
+
+  if (pingTotal > 0) {
+    const okCount = query(`SELECT COUNT(*) as c FROM ping WHERE status='OK'${sf('ping')}`)[0]?.c || 0;
+    const failCount = pingTotal - okCount;
+    pct = ((okCount / pingTotal) * 100);
+    const latStats = query(`SELECT AVG(latency_ms) as avg, MIN(latency_ms) as min, MAX(latency_ms) as max FROM ping WHERE status='OK'${sf('ping')}${noIperfFail}`)[0] || {};
+    avgLat = num(latStats.avg);
+    const minLat = num(latStats.min);
+    const maxLat = num(latStats.max);
+    const p95Row = query(`SELECT latency_ms as v FROM ping WHERE status='OK'${sf('ping')}${noIperfFail} ORDER BY latency_ms ASC LIMIT 1 OFFSET (SELECT CAST(COUNT(*)*0.95 AS INTEGER) FROM ping WHERE status='OK'${sf('ping')}${noIperfFail})`);
+    const p99Row = query(`SELECT latency_ms as v FROM ping WHERE status='OK'${sf('ping')}${noIperfFail} ORDER BY latency_ms ASC LIMIT 1 OFFSET (SELECT CAST(COUNT(*)*0.99 AS INTEGER) FROM ping WHERE status='OK'${sf('ping')}${noIperfFail})`);
+    p95 = p95Row.length ? num(p95Row[0].v) : avgLat;
+    p99 = p99Row.length ? num(p99Row[0].v) : avgLat;
+    const targets = query(`SELECT DISTINCT target FROM ping WHERE 1=1${sf('ping')}${noIperfFail}`).map(r => r.target);
+
+    const iperfNote = iperfFailExcluded > 0 ? ` (${iperfFailExcluded} iperf-Fails ausgeblendet)` : '';
+    statsRows.push(['Ping-Verfuegbarkeit', `${pct.toFixed(1)}%`, `${okCount} / ${pingTotal} OK${iperfNote}`]);
+    statsRows.push(['Latenz Durchschnitt', `${avgLat.toFixed(1)} ms`, `Min: ${minLat.toFixed(1)} / Max: ${maxLat.toFixed(1)} ms`]);
+    statsRows.push(['Latenz P95 / P99', `${p95.toFixed(1)} ms`, `P99: ${p99.toFixed(1)} ms`]);
+    statsRows.push(['Ping-Ausfaelle', `${failCount}`, failCount > 0 ? 'Ohne iperf-bedingte Ausfaelle' : 'Keine']);
+    statsRows.push(['Ping-Ziele', `${targets.length}`, targets.join(', ')]);
+
+    const availPenalty = Math.max(0, (100 - pct) * 5);
+    healthScore -= availPenalty;
+    if (availPenalty > 0) healthParts.push(`Verfuegbarkeit: -${availPenalty.toFixed(0)}`);
+    if (pct < 99) findings.push({ icon: 'WARN', text: `Ping-Verfuegbarkeit bei ${pct.toFixed(1)}% (Ziel: >99%)` });
+    if (p95 > 50) {
+      const latPenalty = Math.min(20, (p95 - 50) / 5);
+      healthScore -= latPenalty;
+      healthParts.push(`P95-Latenz: -${latPenalty.toFixed(0)}`);
+      findings.push({ icon: 'WARN', text: `P95-Latenz ${p95.toFixed(1)}ms ueberschreitet 50ms-Schwelle` });
+    }
+  }
+
+  let avgJit = 0, avgLoss = 0;
+  if (iperfTotal > 0) {
+    const tcpRows = query(`SELECT bandwidth_mbps, retransmits, direction FROM iperf WHERE protocol='TCP'${sf('iperf')}`);
+    const udpRows = query(`SELECT bandwidth_mbps, jitter_ms, packet_loss_pct, direction FROM iperf WHERE protocol='UDP'${sf('iperf')}`);
+
+    if (tcpRows.length) {
+      const bws = tcpRows.map(r => r.bandwidth_mbps);
+      const rts = tcpRows.map(r => r.retransmits).filter(r => r >= 0);
+      const avgBw = (bws.reduce((a,b) => a+b, 0) / bws.length).toFixed(1);
+      const avgRt = rts.length ? (rts.reduce((a,b) => a+b, 0) / rts.length).toFixed(0) : '0';
+      const maxRt = rts.length ? Math.max(...rts) : 0;
+      const tcpUp = tcpRows.filter(r => r.direction === 'Upload');
+      const tcpDn = tcpRows.filter(r => r.direction === 'Download');
+      const upAvg = tcpUp.length ? (tcpUp.reduce((a,r) => a + r.bandwidth_mbps, 0) / tcpUp.length).toFixed(1) : '-';
+      const dnAvg = tcpDn.length ? (tcpDn.reduce((a,r) => a + r.bandwidth_mbps, 0) / tcpDn.length).toFixed(1) : '-';
+      statsRows.push(['TCP Bandbreite', `${avgBw} Mbit/s`, `Upload: ${upAvg} / Download: ${dnAvg} Mbit/s`]);
+      statsRows.push(['TCP Retransmits', `Avg: ${avgRt}`, `Max: ${maxRt} | ${tcpRows.length} Tests`]);
+
+      if (Number(avgRt) > 10) {
+        const rtPenalty = Math.min(15, Number(avgRt) / 5);
+        healthScore -= rtPenalty;
+        healthParts.push(`Retransmits: -${rtPenalty.toFixed(0)}`);
+        findings.push({ icon: 'CRIT', text: `TCP-Retransmits hoch (Avg: ${avgRt}) - Netzwerkueberlastung moeglich` });
+      }
+    }
+
+    if (udpRows.length) {
+      const jitters = udpRows.map(r => r.jitter_ms);
+      const losses = udpRows.map(r => r.packet_loss_pct);
+      const bws = udpRows.map(r => r.bandwidth_mbps);
+      avgJit = jitters.reduce((a,b) => a+b, 0) / jitters.length;
+      const maxJit = Math.max(...jitters);
+      avgLoss = losses.reduce((a,b) => a+b, 0) / losses.length;
+      const avgBw = (bws.reduce((a,b) => a+b, 0) / bws.length).toFixed(1);
+      statsRows.push(['UDP Bandbreite', `${avgBw} Mbit/s`, `${udpRows.length} Tests`]);
+      statsRows.push(['UDP Jitter', `Avg: ${avgJit.toFixed(2)} ms`, `Max: ${maxJit.toFixed(2)} ms`]);
+      statsRows.push(['Paketverlust', `Avg: ${avgLoss.toFixed(2)}%`, `Max: ${Math.max(...losses).toFixed(2)}%`]);
+
+      if (avgJit > 10) {
+        const jitPenalty = Math.min(30, (avgJit - 10) * 1.5);
+        healthScore -= jitPenalty;
+        healthParts.push(`Jitter: -${jitPenalty.toFixed(0)}`);
+        if (avgJit > 30) findings.push({ icon: 'CRIT', text: `Jitter kritisch (${avgJit.toFixed(1)}ms) - Verbindungsabbrueche wahrscheinlich` });
+        else findings.push({ icon: 'WARN', text: `Jitter erhoet (${avgJit.toFixed(1)}ms) - Qualitaetseinbussen moeglich` });
+      }
+      if (avgLoss > 0.5) {
+        const lossPenalty = Math.min(30, avgLoss * 10);
+        healthScore -= lossPenalty;
+        healthParts.push(`Paketverlust: -${lossPenalty.toFixed(0)}`);
+        findings.push({ icon: 'CRIT', text: `Paketverlust ${avgLoss.toFixed(2)}% - Bildschirmfreezes und Eingabeverzoegerungen` });
+      }
+    }
+  }
+
+  healthScore = Math.max(0, Math.round(healthScore));
+  const healthText = healthScore >= 80 ? 'GUT' : healthScore >= 50 ? 'EINGESCHRAENKT' : 'KRITISCH';
+  const healthColor = healthScore >= 80 ? okRgb : healthScore >= 50 ? warnRgb : critRgb;
+  const healthColorLight = healthScore >= 80 ? [220, 252, 231] : healthScore >= 50 ? [254, 243, 199] : [254, 226, 226];
+
+  // ── Health Score Section ──
+  sectionHeader('NETWORK HEALTH SCORE');
+
+  // Score circle
+  const circleX = margin + 22;
+  const circleY = y + 14;
+  const circleR = 14;
+  doc.setDrawColor(...healthColor);
+  doc.setLineWidth(2.5);
+  doc.circle(circleX, circleY, circleR);
+  doc.setLineWidth(0.2);
+  doc.setFontSize(20);
+  doc.setFont('helvetica', 'bold');
+  doc.setTextColor(...healthColor);
+  doc.text(`${healthScore}`, circleX, circleY + 3, { align: 'center' });
+  doc.setFontSize(7);
+  doc.text(healthText, circleX, circleY + 9, { align: 'center' });
+
+  // Score description box
+  const descX = margin + 44;
+  doc.setFillColor(...healthColorLight);
+  doc.roundedRect(descX, y, contentW - 44, 28, 2, 2, 'F');
+  doc.setFontSize(9);
+  doc.setFont('helvetica', 'bold');
+  doc.setTextColor(...darkGray);
+  doc.text(`Bewertung: ${healthText}`, descX + 5, y + 7);
+  doc.setFont('helvetica', 'normal');
+  doc.setFontSize(8);
+  doc.setTextColor(...midGray);
+  if (healthScore >= 80) {
+    doc.text('Das Netzwerk arbeitet im normalen Bereich. Keine kritischen Auffaelligkeiten.', descX + 5, y + 14);
+    doc.text(healthParts.length ? 'Kleinere Abzuege: ' + healthParts.join(', ') : 'Keine Abzuege - volle Punktzahl.', descX + 5, y + 20);
+  } else if (healthScore >= 50) {
+    doc.text('Netzwerk eingeschraenkt. Probleme koennen Produktivitaet beeintraechtigen.', descX + 5, y + 14);
+    doc.text('Abzuege: ' + healthParts.join(', '), descX + 5, y + 20);
+  } else {
+    doc.text('Netzwerk stark beeintraechtigt! Sofortige Analyse und Massnahmen empfohlen.', descX + 5, y + 14);
+    doc.text('Abzuege: ' + healthParts.join(', '), descX + 5, y + 20);
+  }
+  y += 34;
+
+  // ── Findings / Auffaelligkeiten ──
+  if (findings.length) {
+    sectionHeader('AUFFAELLIGKEITEN');
+    findings.forEach(f => {
+      checkPage(8);
+      const bgColor = f.icon === 'CRIT' ? [254, 226, 226] : [254, 243, 199];
+      const fgColor = f.icon === 'CRIT' ? critRgb : warnRgb;
+      const badge = f.icon === 'CRIT' ? 'KRITISCH' : 'WARNUNG';
+      doc.setFillColor(...bgColor);
+      doc.roundedRect(margin, y - 3.5, contentW, 7, 1, 1, 'F');
+      doc.setFontSize(6.5);
+      doc.setFont('helvetica', 'bold');
+      doc.setTextColor(...fgColor);
+      doc.text(badge, margin + 2, y + 0.5);
+      doc.setFont('helvetica', 'normal');
+      doc.setFontSize(8);
+      doc.setTextColor(...darkGray);
+      doc.text(f.text, margin + 20, y + 0.5);
+      y += 9;
+    });
+    y += 3;
+  } else {
+    sectionHeader('AUFFAELLIGKEITEN');
+    doc.setFillColor(220, 252, 231);
+    doc.roundedRect(margin, y - 3.5, contentW, 7, 1, 1, 'F');
+    doc.setFontSize(8);
+    doc.setFont('helvetica', 'normal');
+    doc.setTextColor(...okRgb);
+    doc.text('Keine Auffaelligkeiten - alle Werte im normalen Bereich.', margin + 3, y + 0.5);
+    y += 12;
+  }
+
+  // ── Overview Stats Table ──
+  sectionHeader('KENNZAHLEN');
+  doc.autoTable({
+    startY: y,
+    margin: { left: margin, right: margin },
+    head: [['Metrik', 'Wert', 'Detail']],
+    body: statsRows,
+    styles: { fontSize: 8, cellPadding: 2.5, textColor: darkGray },
+    headStyles: { fillColor: accentRgb, textColor: [255,255,255], fontStyle: 'bold', fontSize: 8 },
+    alternateRowStyles: { fillColor: lightBg },
+    columnStyles: { 0: { fontStyle: 'bold', cellWidth: 42 }, 1: { cellWidth: 32, halign: 'right' } },
+    didParseCell: (data) => {
+      if (data.section === 'body' && data.column.index === 1) {
+        const val = data.cell.raw;
+        if (val && val.includes('%')) {
+          const n = parseFloat(val);
+          if (n >= 99) data.cell.styles.textColor = okRgb;
+          else if (n >= 95) data.cell.styles.textColor = warnRgb;
+          else data.cell.styles.textColor = critRgb;
+        }
+      }
+    }
+  });
+  y = doc.lastAutoTable.finalY + 10;
+
+  // ── Ping per target ──
+  if (pingTotal > 0) {
+    const targetData = query(`SELECT target, COUNT(*) as total,
+      SUM(CASE WHEN status='OK' THEN 1 ELSE 0 END) as ok,
+      SUM(CASE WHEN status='FAIL' AND during_iperf=0 THEN 1 ELSE 0 END) as fails,
+      ROUND(AVG(CASE WHEN status='OK' THEN latency_ms END), 1) as avg_lat,
+      MAX(CASE WHEN status='OK' THEN latency_ms END) as max_lat
+      FROM ping WHERE 1=1${sf('ping')}${noIperfFail} GROUP BY target ORDER BY target`);
+
+    if (targetData.length) {
+      sectionHeader('PING-ERGEBNISSE PRO ZIEL');
+      doc.autoTable({
+        startY: y,
+        margin: { left: margin, right: margin },
+        head: [['Ziel', 'Pings', 'OK', 'Ausfaelle', 'Verfuegbarkeit', 'Avg Latenz', 'Max Latenz']],
+        body: targetData.map(r => [
+          r.target, r.total, r.ok, r.fails,
+          ((r.ok / r.total) * 100).toFixed(1) + '%',
+          (r.avg_lat || 0).toFixed(1) + ' ms',
+          (r.max_lat || 0).toFixed(1) + ' ms'
+        ]),
+        styles: { fontSize: 8, cellPadding: 2.5, textColor: darkGray },
+        headStyles: { fillColor: accentRgb, textColor: [255,255,255], fontStyle: 'bold', fontSize: 8 },
+        alternateRowStyles: { fillColor: lightBg },
+        columnStyles: { 4: { halign: 'right' }, 5: { halign: 'right' }, 6: { halign: 'right' } },
+        didParseCell: (data) => {
+          if (data.section === 'body' && data.column.index === 4) {
+            const n = parseFloat(data.cell.raw);
+            if (n >= 99.5) data.cell.styles.textColor = okRgb;
+            else if (n >= 95) data.cell.styles.textColor = warnRgb;
+            else data.cell.styles.textColor = critRgb;
+            data.cell.styles.fontStyle = 'bold';
+          }
+        }
+      });
+      y = doc.lastAutoTable.finalY + 10;
+    }
+  }
+
+  // ── iperf summary ──
+  if (iperfTotal > 0) {
+    const iperfSummary = query(`SELECT protocol, direction,
+      COUNT(*) as tests,
+      ROUND(AVG(bandwidth_mbps), 1) as avg_bw,
+      ROUND(MIN(bandwidth_mbps), 1) as min_bw,
+      ROUND(MAX(bandwidth_mbps), 1) as max_bw,
+      ROUND(AVG(jitter_ms), 2) as avg_jit,
+      ROUND(MAX(jitter_ms), 2) as max_jit,
+      ROUND(AVG(packet_loss_pct), 2) as avg_loss,
+      ROUND(MAX(packet_loss_pct), 2) as max_loss,
+      ROUND(AVG(retransmits), 0) as avg_rt,
+      MAX(retransmits) as max_rt
+      FROM iperf WHERE 1=1${sf('iperf')} GROUP BY protocol, direction ORDER BY protocol, direction`);
+
+    if (iperfSummary.length) {
+      sectionHeader('IPERF3 PERFORMANCE-ERGEBNISSE');
+      doc.autoTable({
+        startY: y,
+        margin: { left: margin, right: margin },
+        head: [['Protokoll', 'Richtung', 'Tests', 'Bandbreite Avg', 'BW Min/Max', 'Jitter Avg', 'Loss Avg', 'Retrans.']],
+        body: iperfSummary.map(r => [
+          r.protocol, r.direction, r.tests,
+          r.avg_bw + ' Mbit/s',
+          r.min_bw + ' / ' + r.max_bw + ' Mbit/s',
+          r.protocol === 'UDP' ? r.avg_jit + ' ms' : '-',
+          r.protocol === 'UDP' ? r.avg_loss + '%' : '-',
+          r.protocol === 'TCP' ? `Avg: ${r.avg_rt} / Max: ${r.max_rt}` : '-'
+        ]),
+        styles: { fontSize: 7.5, cellPadding: 2.5, textColor: darkGray },
+        headStyles: { fillColor: accentRgb, textColor: [255,255,255], fontStyle: 'bold', fontSize: 7.5 },
+        alternateRowStyles: { fillColor: lightBg },
+        didParseCell: (data) => {
+          if (data.section === 'body') {
+            if (data.column.index === 5) {
+              const n = parseFloat(data.cell.raw);
+              if (!isNaN(n) && n > 0) {
+                data.cell.styles.textColor = n < 10 ? okRgb : n < 30 ? warnRgb : critRgb;
+              }
+            }
+            if (data.column.index === 6) {
+              const n = parseFloat(data.cell.raw);
+              if (!isNaN(n) && n > 0) {
+                data.cell.styles.textColor = n < 1 ? okRgb : n < 5 ? warnRgb : critRgb;
+              }
+            }
+          }
+        }
+      });
+      y = doc.lastAutoTable.finalY + 10;
+    }
+  }
+
+  // ── Methodology note ──
+  checkPage(20);
+  doc.setFillColor(241, 245, 249);
+  doc.roundedRect(margin, y, contentW, 16, 2, 2, 'F');
+  doc.setFontSize(7);
+  doc.setFont('helvetica', 'bold');
+  doc.setTextColor(...midGray);
+  doc.text('Methodik', margin + 4, y + 5);
+  doc.setFont('helvetica', 'normal');
+  doc.setFontSize(6.5);
+  doc.text('Health Score: 100 Punkte Basis, Abzuege fuer Verfuegbarkeit (<99%), P95-Latenz (>50ms), Jitter (>10ms), Paketverlust (>0.5%), Retransmits (>10 Avg).', margin + 4, y + 10);
+  doc.text(`Ping-Ausfaelle waehrend laufender iperf-Tests (${iperfFailExcluded}) werden in der Auswertung nicht beruecksichtigt (Bandbreitensaettigung).`, margin + 4, y + 14);
+
+  addFooters();
+
+  const sessionName = currentSession === 'all' ? 'alle-sessions' : currentSession;
+  doc.save(`network-report-${sessionName}.pdf`);
+  showToast('PDF-Report gespeichert');
 }
 
 // CSV Export

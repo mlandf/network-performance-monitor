@@ -584,6 +584,24 @@ $script:iperfTimer.Add_Tick({
                 Invoke-SqliteQuery -DataSource $db -Query "PRAGMA busy_timeout=5000" -ErrorAction SilentlyContinue
             } catch {}
 
+            function Run-Iperf3 {
+                param([string]$Exe, [string[]]$Args)
+                $errFile = [System.IO.Path]::GetTempFileName()
+                try {
+                    $proc = Start-Process -FilePath $Exe -ArgumentList $Args -NoNewWindow -Wait -PassThru `
+                        -RedirectStandardOutput "$errFile.out" -RedirectStandardError $errFile
+                    $stdout = Get-Content "$errFile.out" -Raw -ErrorAction SilentlyContinue
+                    $stderr = Get-Content $errFile -Raw -ErrorAction SilentlyContinue
+                    Remove-Item "$errFile.out" -Force -ErrorAction SilentlyContinue
+                    Remove-Item $errFile -Force -ErrorAction SilentlyContinue
+                    return @{ stdout = $stdout; stderr = $stderr; exitCode = $proc.ExitCode }
+                } catch {
+                    Remove-Item "$errFile.out" -Force -ErrorAction SilentlyContinue
+                    Remove-Item $errFile -Force -ErrorAction SilentlyContinue
+                    return @{ stdout = $null; stderr = $_.Exception.Message; exitCode = -1 }
+                }
+            }
+
             $results = @()
 
             foreach ($dir in @('Upload','Download')) {
@@ -592,29 +610,36 @@ $script:iperfTimer.Add_Tick({
 
                 # TCP
                 try {
-                    $tcpArgs = @('-c', $tgt, '-p', $p, '-t', $dur, '-i', '1', '--json')
-                    if ($reverseFlag) { $tcpArgs += $reverseFlag }
-                    $tcpOut = & $exe @tcpArgs 2>&1
-                    $tcpJson = $tcpOut | Out-String | ConvertFrom-Json
+                    $tcpArgs = "-c $tgt -p $p -t $dur -i 0 --json"
+                    if ($reverseFlag) { $tcpArgs += " $reverseFlag" }
+                    $run = Run-Iperf3 -Exe $exe -Args ($tcpArgs -split ' ')
+                    if (-not $run.stdout) { throw "iperf3 kein Output. Stderr: $($run.stderr)" }
+                    $tcpJson = $run.stdout | ConvertFrom-Json
+                    if ($tcpJson.error) { throw "iperf3: $($tcpJson.error)" }
                     if ($tcpJson.end) {
                         $sumKey = if ($dir -eq 'Download') { 'sum_received' } else { 'sum_sent' }
                         $sumObj = $tcpJson.end.$sumKey
                         if (-not $sumObj) { $sumObj = $tcpJson.end.sum_sent }
+                        if (-not $sumObj) { throw "iperf3 JSON: kein sum_sent/sum_received in end-Block" }
                         $bw = [math]::Round($sumObj.bits_per_second / 1000000, 2)
-                        $retrans = if ($sumObj.retransmits) { $sumObj.retransmits } else { 0 }
+                        $retrans = if ($null -ne $sumObj.retransmits) { $sumObj.retransmits } else { 0 }
                         $cpu = if ($tcpJson.end.cpu_utilization_percent) {
                             [math]::Round($tcpJson.end.cpu_utilization_percent.host_total, 1)
                         } else { 0 }
+                        if ($bw -le 0) { throw "iperf3 TCP $dir: Bandbreite=0 (vermutlich Verbindungsfehler). Raw: $($run.stdout.Substring(0, [math]::Min(200, $run.stdout.Length)))" }
                         Invoke-SqliteQuery -DataSource $db -Query `
                             "INSERT INTO iperf (timestamp,session_id,target,protocol,direction,bandwidth_mbps,jitter_ms,packet_loss_pct,retransmits,cpu_pct) VALUES (@ts,@sid,@tgt,'TCP',@dir,@bw,0,0,@rt,@cpu)" `
                             -SqlParameters @{ts=$timestamp;sid=$sessionId;tgt=$tgt;dir=$dir;bw=$bw;rt=$retrans;cpu=$cpu}
                         $results += "TCP $dir : ${bw} Mbit/s, Retransmits: $retrans"
+                    } else {
+                        throw "iperf3 JSON: kein end-Block. Raw: $($run.stdout.Substring(0, [math]::Min(200, $run.stdout.Length)))"
                     }
                 } catch {
+                    $errMsg = $_.Exception.Message
                     Invoke-SqliteQuery -DataSource $db -Query `
-                        "INSERT INTO iperf (timestamp,session_id,target,protocol,direction,bandwidth_mbps,jitter_ms,packet_loss_pct,retransmits,cpu_pct) VALUES (@ts,@sid,@tgt,'TCP',@dir,0,0,0,-1,0)" `
+                        "INSERT INTO iperf (timestamp,session_id,target,protocol,direction,bandwidth_mbps,jitter_ms,packet_loss_pct,retransmits,cpu_pct) VALUES (@ts,@sid,@tgt,'TCP',@dir,-1,0,0,-1,0)" `
                         -SqlParameters @{ts=$timestamp;sid=$sessionId;tgt=$tgt;dir=$dir}
-                    $results += "TCP $dir : FEHLER - $($_.Exception.Message)"
+                    $results += "TCP $dir : FEHLER - $errMsg"
                 }
 
                 Start-Sleep -Seconds 2
@@ -622,14 +647,18 @@ $script:iperfTimer.Add_Tick({
                 # UDP
                 $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
                 try {
-                    $udpArgs = @('-c', $tgt, '-p', $p, '-t', $dur, '-i', '1', '-u', '-b', "${br}M", '--json')
-                    if ($reverseFlag) { $udpArgs += $reverseFlag }
-                    $udpOut = & $exe @udpArgs 2>&1
-                    $udpJson = $udpOut | Out-String | ConvertFrom-Json
+                    $udpArgs = "-c $tgt -p $p -t $dur -i 0 -u -b ${br}M --json"
+                    if ($reverseFlag) { $udpArgs += " $reverseFlag" }
+                    $run = Run-Iperf3 -Exe $exe -Args ($udpArgs -split ' ')
+                    if (-not $run.stdout) { throw "iperf3 kein Output. Stderr: $($run.stderr)" }
+                    $udpJson = $run.stdout | ConvertFrom-Json
+                    if ($udpJson.error) { throw "iperf3: $($udpJson.error)" }
                     if ($udpJson.end) {
-                        $bw = [math]::Round($udpJson.end.sum.bits_per_second / 1000000, 2)
-                        $jitter = [math]::Round($udpJson.end.sum.jitter_ms, 3)
-                        $loss = [math]::Round($udpJson.end.sum.lost_percent, 2)
+                        $sumObj = $udpJson.end.sum
+                        if (-not $sumObj) { throw "iperf3 JSON: kein sum in end-Block" }
+                        $bw = [math]::Round($sumObj.bits_per_second / 1000000, 2)
+                        $jitter = if ($null -ne $sumObj.jitter_ms) { [math]::Round($sumObj.jitter_ms, 3) } else { 0 }
+                        $loss = if ($null -ne $sumObj.lost_percent) { [math]::Round($sumObj.lost_percent, 2) } else { 0 }
                         $cpu = if ($udpJson.end.cpu_utilization_percent) {
                             [math]::Round($udpJson.end.cpu_utilization_percent.host_total, 1)
                         } else { 0 }
@@ -637,12 +666,15 @@ $script:iperfTimer.Add_Tick({
                             "INSERT INTO iperf (timestamp,session_id,target,protocol,direction,bandwidth_mbps,jitter_ms,packet_loss_pct,retransmits,cpu_pct) VALUES (@ts,@sid,@tgt,'UDP',@dir,@bw,@jit,@loss,0,@cpu)" `
                             -SqlParameters @{ts=$timestamp;sid=$sessionId;tgt=$tgt;dir=$dir;bw=$bw;jit=$jitter;loss=$loss;cpu=$cpu}
                         $results += "UDP $dir : ${bw} Mbit/s, Jitter: ${jitter}ms, Loss: ${loss}%"
+                    } else {
+                        throw "iperf3 JSON: kein end-Block. Raw: $($run.stdout.Substring(0, [math]::Min(200, $run.stdout.Length)))"
                     }
                 } catch {
+                    $errMsg = $_.Exception.Message
                     Invoke-SqliteQuery -DataSource $db -Query `
-                        "INSERT INTO iperf (timestamp,session_id,target,protocol,direction,bandwidth_mbps,jitter_ms,packet_loss_pct,retransmits,cpu_pct) VALUES (@ts,@sid,@tgt,'UDP',@dir,0,0,100,0,0)" `
+                        "INSERT INTO iperf (timestamp,session_id,target,protocol,direction,bandwidth_mbps,jitter_ms,packet_loss_pct,retransmits,cpu_pct) VALUES (@ts,@sid,@tgt,'UDP',@dir,-1,-1,-1,0,0)" `
                         -SqlParameters @{ts=$timestamp;sid=$sessionId;tgt=$tgt;dir=$dir}
-                    $results += "UDP $dir : FEHLER - $($_.Exception.Message)"
+                    $results += "UDP $dir : FEHLER - $errMsg"
                 }
 
                 Start-Sleep -Seconds 2
@@ -654,6 +686,8 @@ $script:iperfTimer.Add_Tick({
         $script:iperfJob = Start-Job -ScriptBlock $scriptBlock -ArgumentList @(
             $iperfExe, $target, $port, $duration, $udpBitrate, $dbPath, $sid
         )
+        $script:iperfJobStarted = Get-Date
+        $script:iperfJobTimeout = [int]$duration * 4 * 4 + 60
 
         $script:jobCheckTimer = New-Object System.Windows.Threading.DispatcherTimer
         $script:jobCheckTimer.Interval = [TimeSpan]::FromSeconds(2)
@@ -669,7 +703,7 @@ $script:iperfTimer.Add_Tick({
                 Update-Stats
                 Update-Status "Monitoring aktiv - naechster iperf in $($txtIperfInterval.Text) Min."
                 $script:iperfRunning = $false
-                $script:pingPause.Set()  # Resume pings
+                $script:pingPause.Set()
                 $script:jobCheckTimer.Stop()
             }
             elseif ($script:iperfJob -and $script:iperfJob.State -eq "Failed") {
@@ -678,8 +712,18 @@ $script:iperfTimer.Add_Tick({
                 Remove-Job -Job $script:iperfJob -Force
                 $script:iperfJob = $null
                 $script:iperfRunning = $false
-                $script:pingPause.Set()  # Resume pings
+                $script:pingPause.Set()
                 $script:jobCheckTimer.Stop()
+            }
+            elseif ($script:iperfJob -and ((Get-Date) - $script:iperfJobStarted).TotalSeconds -gt $script:iperfJobTimeout) {
+                Write-Log "iperf3 Job Timeout nach $($script:iperfJobTimeout)s - wird abgebrochen"
+                Stop-Job -Job $script:iperfJob -ErrorAction SilentlyContinue
+                Remove-Job -Job $script:iperfJob -Force -ErrorAction SilentlyContinue
+                $script:iperfJob = $null
+                $script:iperfRunning = $false
+                $script:pingPause.Set()
+                $script:jobCheckTimer.Stop()
+                Update-Status "iperf3 Timeout - Monitoring laeuft weiter"
             }
         })
         $script:jobCheckTimer.Start()
